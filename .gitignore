@@ -1,0 +1,104 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+dist/
+build/
+*.so
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# MODFLOW binary output files (large, regenerable)
+mf6_workspace/*.hds
+mf6_workspace/*.cbc
+mf6_workspace/*.dis.grb
+mf6_workspace/*.lst
+mf6_workspace/mfsim.lst
+mf6_workspace/mfsim.nam
+
+# MODPATH binary output files (large, regenerable)
+mp7_workspace/*.mppth
+mp7_workspace/*.mpend
+mp7_workspace/*.mplst
+mp7_workspace/*.log
+
+# Large GIS raster files (regenerable from source data)
+output/*.tif
+output/basins.tif
+output/streams.tif
+output/flow_acc.tif
+output/flow_dir.tif
+output/dem_conditioned.tif
+output/merged_dem*.tif
+output/modflow_grid_100m.geojson
+
+# Raw data (too large for GitHub, distribute separately)
+Elevation/
+Bathymetry/
+Fiji/
+
+# Images (optional - can be regenerated)
+# Uncomment the lines below if you want to exclude images from the repo
+# output/*.png
+# output/*.gif
+
+# Sensitive / personal
+LINE_ALBUM_*.jpg
+調査地点図.png
+
+# Notebooks (large, include .py versions instead)
+*.ipynb
+
+# Scratch / helper scripts (not part of main model)
+check.py
+ept_keys.txt
+explore_excel.py
+extract_cells.py
+extract_points.py
+inspect_data.py
+modify_notebook.py
+mp_check.txt
+out.log
+tmp_updater.py
+
+# Iteration prompts (internal workflow)
+prompt_*.md
+
+# Legacy scripts (pre-v3)
+analyze_results.py
+build_modflow_model.py
+calc_domain_georef.py
+create_model_domain.py
+plan_investigation.py
+plan_investigation_v3.py
+plot_3d_modpath.py
+plot_catchment_map.py
+plot_clean_catchment_map.py
+plot_flopy_pub.py
+plot_high_vis_pathlines.py
+plot_results.py
+prepare_modflow_data.py
+run_calibration.py
+run_final_calibration.py
+run_hydrology.py
+run_iriomote_style.py
+run_modpath.py
+
+# Subdirectories with raw/unrelated data
+Fiji Modflow/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
