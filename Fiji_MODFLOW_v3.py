@@ -231,8 +231,8 @@ try:
         'head_obs': gw_data['GW head (m)']
     })
 
-    # Filter valid records
-    gw_obs = gw_obs[gw_obs['site'].isin([f'FG{i}' for i in range(1, 10)])].copy()
+    # Filter valid records (Exclude FG9 which is on another island)
+    gw_obs = gw_obs[gw_obs['site'].isin([f'FG{i}' for i in range(1, 9)])].copy()
     gw_obs = gw_obs.dropna(subset=['lat', 'lon', 'elev'])
 
     logger.info(f"Loaded {len(gw_obs)} groundwater observation points")
@@ -752,10 +752,19 @@ if not args.dry_run and hds_exists:
             hds = bf.HeadFile(head_file)
             heads = hds.get_data(totim=hds.get_times()[-1])
 
-            # Plan view of layer 1 heads
+            # Plan view of layer 1 heads using flopy PlotMapView
             fig, ax = plt.subplots(figsize=(14, 10))
-            extent = [xmin, xmax, ymin, ymax]
-            im = ax.imshow(heads[0], extent=extent, origin='upper', cmap='viridis', alpha=0.8)
+            pmv = flopy.plot.PlotMapView(model=gwf, ax=ax, layer=0)
+            
+            # Plot valid heads
+            heads_ma = np.ma.masked_where((heads[0] > 1e10) | (heads[0] < -100) | (ibound == 0), heads[0])
+            im = pmv.plot_array(heads_ma, cmap='viridis', alpha=0.8, vmin=0, vmax=150)
+
+            # Plot pathlines!
+            p_file = os.path.join(mp7_dir, f"{sim_name}_mp7.mppth")
+            if os.path.exists(p_file):
+                plines = flopy.utils.PathlineFile(p_file).get_alldata()
+                pmv.plot_pathline(plines, layer='all', colors='white', lw=1.0, alpha=0.6, label='Pathlines')
 
             # Overlay streams (DRN cells from stream_grid)
             ax.contour(
@@ -763,17 +772,17 @@ if not args.dry_run and hds_exists:
                 stream_grid, levels=[0.5], colors='cyan', linewidths=0.5
             )
 
-            # Overlay observation points
-            if river_gdf is not None:
-                river_gdf.plot(ax=ax, color='red', markersize=50, marker='s', label='River obs', alpha=0.7)
-            if gw_gdf is not None:
-                gw_gdf.plot(ax=ax, color='blue', markersize=50, marker='o', label='GW obs', alpha=0.7)
+            # Overlay observation points (FG9 is already filtered out)
+            if river_gdf is not None and not river_gdf.empty:
+                river_gdf.plot(ax=ax, color='red', markersize=50, marker='s', label='River obs', alpha=0.7, zorder=5)
+            if gw_gdf is not None and not gw_gdf.empty:
+                gw_gdf.plot(ax=ax, color='blue', markersize=50, marker='o', label='GW obs', alpha=0.7, zorder=5)
 
-            ax.set_title(f"MODFLOW 6 v3 - Layer 1 Hydraulic Head (m)", fontsize=14)
+            ax.set_title(f"MODFLOW 6 v3 - Layer 1 Hydraulic Head & Pathlines", fontsize=14)
             ax.set_xlabel("UTM Easting (m)")
             ax.set_ylabel("UTM Northing (m)")
             cbar = plt.colorbar(im, ax=ax, label="Head (m)")
-            ax.legend()
+            ax.legend(loc='lower right')
 
             plan_view_file = os.path.join(output_dir, 'modflow_v3_plan_view.png')
             plt.savefig(plan_view_file, dpi=300, bbox_inches='tight')
