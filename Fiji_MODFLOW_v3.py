@@ -141,11 +141,11 @@ basin_mask = rasterize(
 # Mark highland cells (elevation > 50m) as reference for K variation
 highland_mask = (top > 50.0)
 
-# Deactivate cells outside focal basin
-ibound[(ibound == 1) & (basin_mask == 0)] = 0
+# User requested to NOT exclude analysis domains. Run on the full domain!
+# ibound[(ibound == 1) & (basin_mask == 0)] = 0
 
-# Open coastal low-elevation areas (<5m) to allow coastal flow
-ibound[(ibound == 0) & (top < 5.0) & (top >= 0)] = 1
+# STRICTLY use the ibound specified by the user in model_ibound.csv!
+# ibound[(ibound == 0) & (top < 5.0) & (top >= 0)] = 1
 
 logger.info("Basin masking completed")
 
@@ -752,72 +752,75 @@ if not args.dry_run and hds_exists:
             hds = bf.HeadFile(head_file)
             heads = hds.get_data(totim=hds.get_times()[-1])
 
-            # Plan view of layer 1 heads using flopy PlotMapView
+            # Plan View Plotting
             fig, ax = plt.subplots(figsize=(14, 10))
-            pmv = flopy.plot.PlotMapView(model=gwf, ax=ax, layer=0)
-            
-            # Plot valid heads
+            extent = [xmin, xmax, ymin, ymax]
             heads_ma = np.ma.masked_where((heads[0] > 1e10) | (heads[0] < -100) | (ibound == 0), heads[0])
+            
+            pmv = flopy.plot.PlotMapView(model=gwf, ax=ax, layer=0)
             im = pmv.plot_array(heads_ma, cmap='viridis', alpha=0.8, vmin=0, vmax=150)
+            
+            # Plot Head Contours
+            contours = pmv.contour_array(heads[0], masked_values=[1e30], levels=np.arange(0, 160, 10), colors='white', linewidths=0.5, alpha=0.8)
+            plt.clabel(contours, fmt='%.0f', colors='white', fontsize=8)
 
-            # Plot pathlines!
             p_file = os.path.join(mp7_dir, f"{sim_name}_mp7.mppth")
             if os.path.exists(p_file):
                 plines = flopy.utils.PathlineFile(p_file).get_alldata()
-                pmv.plot_pathline(plines, layer='all', colors='white', lw=1.0, alpha=0.6, label='Pathlines')
+                pmv.plot_pathline(plines, layer='all', colors='white', lw=1.2, alpha=0.8, label='Pathlines')
 
-            # Overlay streams (DRN cells from stream_grid)
-            ax.contour(
-                np.linspace(xmin, xmax, ncol), np.linspace(ymax, ymin, nrow),
-                stream_grid, levels=[0.5], colors='cyan', linewidths=0.5
-            )
-
-            # Overlay observation points (FG9 is already filtered out)
+            # Plot Points MANUALLY to guarantee they are HUGE
             if river_gdf is not None and not river_gdf.empty:
-                river_gdf.plot(ax=ax, color='red', markersize=50, marker='s', label='River obs', alpha=0.7, zorder=5)
+                ax.scatter(river_gdf.geometry.x, river_gdf.geometry.y, c='red', s=350, marker='s', edgecolors='black', linewidths=2.0, zorder=10, label='River Obs (FR)')
             if gw_gdf is not None and not gw_gdf.empty:
-                gw_gdf.plot(ax=ax, color='blue', markersize=50, marker='o', label='GW obs', alpha=0.7, zorder=5)
+                ax.scatter(gw_gdf.geometry.x, gw_gdf.geometry.y, c='aqua', s=350, marker='^', edgecolors='black', linewidths=2.0, zorder=10, label='GW Obs (FG)')
 
-            ax.set_title(f"MODFLOW 6 v3 - Layer 1 Hydraulic Head & Pathlines", fontsize=14)
-            ax.set_xlabel("UTM Easting (m)")
-            ax.set_ylabel("UTM Northing (m)")
-            cbar = plt.colorbar(im, ax=ax, label="Head (m)")
-            ax.legend(loc='lower right')
+            ax.set_xlim([xmin, xmax])
+            ax.set_ylim([ymin, ymax])
+            ax.set_title("MODFLOW 6 v3 - Layer 1 Hydraulic Head & Pathlines", fontsize=18)
+            ax.set_xlabel("UTM Easting (m)", fontsize=14)
+            ax.set_ylabel("UTM Northing (m)", fontsize=14)
+            plt.colorbar(im, ax=ax, label="Head (m)")
+            ax.legend(loc='lower right', fontsize=14)
 
             plan_view_file = os.path.join(output_dir, 'modflow_v3_plan_view.png')
             plt.savefig(plan_view_file, dpi=300, bbox_inches='tight')
             logger.info(f"Saved plan view: {plan_view_file}")
             plt.close()
 
-            # Cross-section along column nc/2
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
-
+            # Cross Section
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12))
             col_idx = ncol // 2
-            xs = np.arange(nrow) * 100.0 + ymin
+            ys = ymax - np.arange(nrow) * 100.0 - 50.0
 
-            # Plot elevation and heads
-            ax1.plot(xs, top[:, col_idx], 'k-', linewidth=2, label='DEM')
+            ax1.plot(ys, top[:, col_idx], 'k-', linewidth=3, label='DEM')
             for l in range(nlay):
-                ax1.plot(xs, botm[l, :, col_idx], 'k--', linewidth=1, alpha=0.5)
+                ax1.plot(ys, botm[l, :, col_idx], 'k--', linewidth=1, alpha=0.5)
+
+            colors = ['blue', 'cyan', 'green', 'goldenrod']
             for l in range(nlay):
-                ax1.plot(xs, heads[l, :, col_idx], label=f'L{l+1}', linewidth=1.5)
+                heads_ma_xs = np.ma.masked_where((heads[l, :, col_idx] > 1e10) | (heads[l, :, col_idx] < -100) | (ibound[:, col_idx] == 0), heads[l,:,col_idx])
+                ax1.plot(ys, heads_ma_xs, label=f'L{l+1} Head', linewidth=2.5, color=colors[l])
 
-            ax1.set_ylabel("Elevation (m)")
-            ax1.set_title(f"Cross-section at Column {col_idx}")
-            ax1.legend()
-            ax1.grid()
+            ax1.set_ylim([-600, np.nanmax(top[:, col_idx]) + 50])
+            ax1.set_ylabel("Elevation (m)", fontsize=14)
+            ax1.set_title(f"Cross-section (Northing profile) at Column {col_idx} (Easting ~ {xmin + col_idx*100}m)", fontsize=16)
+            ax1.legend(loc='upper right', fontsize=12)
+            ax1.grid(True)
 
-            # Plot K distribution
-            ax2.plot(xs, k1[:, col_idx], label='K1', linewidth=1.5)
-            ax2.plot(xs, k2[:, col_idx], label='K2', linewidth=1.5)
-            ax2.plot(xs, k3[:, col_idx], label='K3', linewidth=1.5)
-            ax2.plot(xs, k4[:, col_idx], label='K4', linewidth=1.5)
-
-            ax2.set_xlabel("Northing (m)")
-            ax2.set_ylabel("Hydraulic Conductivity (m/day)")
-            ax2.set_title("Hydraulic Conductivity Distribution")
+            ax2.plot(ys, k1[:, col_idx], label='K1', linewidth=1.5)
+            ax2.plot(ys, k2[:, col_idx], label='K2', linewidth=1.5)
+            ax2.plot(ys, k3[:, col_idx], label='K3', linewidth=1.5)
+            ax2.plot(ys, k4[:, col_idx], label='K4', linewidth=1.5)
+            ax2.set_xlabel("Northing (m)", fontsize=14)
+            ax2.set_ylabel("K (m/day)", fontsize=14)
             ax2.legend()
-            ax2.grid()
+            ax2.grid(True)
+
+            xsec_file = os.path.join(output_dir, 'modflow_v3_cross_section.png')
+            plt.savefig(xsec_file, dpi=300, bbox_inches='tight')
+            logger.info(f"Saved cross-section: {xsec_file}")
+            plt.close()
 
             xsec_file = os.path.join(output_dir, 'modflow_v3_cross_section.png')
             plt.savefig(xsec_file, dpi=300, bbox_inches='tight')
