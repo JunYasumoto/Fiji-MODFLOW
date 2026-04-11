@@ -25,6 +25,8 @@ from matplotlib.colors import LightSource, ListedColormap
 import matplotlib.patches as mpatches
 from rasterio.transform import from_origin
 from rasterio.features import rasterize
+from shapely.geometry import box, Point
+from shapely.ops import unary_union
 import flopy
 import flopy.utils.binaryfile as bf
 import argparse
@@ -119,19 +121,50 @@ logger.info(f"Loaded {len(basins)} basins")
 # Section 4: Basin Masking and Domain Setup
 # ============================================================================
 
-logger.info("Setting up domain and basin masking...")
+logger.info("Setting up domain and basin masking based on v2 complex logic...")
 
 transform = from_origin(xmin, ymax, 100.0, 100.0)
 
-# Select focal basins (Rakiraki region: basins 2422 and 2344)
-focal_basins = basins[basins['VALUE'].isin(['2422', '2344'])].copy()
-focal_basins['geometry'] = focal_basins.geometry.buffer(150)  # 150m buffer
+# --- 2. 解析領域の基本ポリゴンを作る (v2 logic) ---
+target_basins = []
+special_ids = ['2647', '4373', '4549', '3880', '4007', '3437', '4559']
 
-logger.info(f"Focal basins: {list(focal_basins['VALUE'])}")
+for _, row in basins.iterrows():
+    geom = row.geometry
+    val = str(row['VALUE'])
+    minx, miny, maxx, maxy = geom.bounds
+    cx, cy = geom.centroid.x, geom.centroid.y
 
-# Create basin mask
+    if val in special_ids:
+        target_basins.append(geom.buffer(1))
+        continue
+
+    # 西端にはみ出したノイズ流域を除去
+    if minx < xmin + 10:
+        continue
+
+    # 南東の不要半島を除去
+    if cx > 631500 and cy < 8072000:
+        continue
+
+    # 東側南端で解析範囲をまたぐ途切れた流域を除去
+    if cx > 625000 and miny < ymin + 10:
+        continue
+
+    target_basins.append(geom.buffer(1))
+
+merged_basin = unary_union(target_basins)
+if merged_basin.geom_type == 'MultiPolygon':
+    mainland = max(merged_basin.geoms, key=lambda p: p.area)
+else:
+    mainland = merged_basin
+
+domain_box = box(xmin, ymin, xmax, ymax)
+final_basin_poly = mainland.buffer(-1).buffer(150).intersection(domain_box)
+
+# --- 3. basin_mask を作って active / inactive を更新 ---
 basin_mask = rasterize(
-    [(geom, 1) for geom in focal_basins.geometry],
+    [(final_basin_poly, 1)],
     out_shape=(nrow, ncol),
     transform=transform,
     fill=0,
@@ -141,11 +174,36 @@ basin_mask = rasterize(
 # Mark highland cells (elevation > 50m) as reference for K variation
 highland_mask = (top > 50.0)
 
-# User requested to NOT exclude analysis domains. Run on the full domain!
-# ibound[(ibound == 1) & (basin_mask == 0)] = 0
+ibound[(ibound == 1) & (basin_mask == 0)] = 0
 
-# STRICTLY use the ibound specified by the user in model_ibound.csv!
-# ibound[(ibound == 0) & (top < 5.0) & (top >= 0)] = 1
+# 沿岸低地は少し広めに active にして、沿岸井戸や海岸近傍地下水を入れやすくする
+coastal_open = (ibound == 0) & (basin_mask == 1) & (top < 10.0) & (top >= 0.0)
+ibound[coastal_open] = 1
+
+# --- 4. 観測点周辺は確実に active にする ---
+obs_points_wgs84 = [
+    ("FR2", -17.3803293, 178.1541107),
+    ("FR3", -17.4033547, 178.1147045),
+    ("FR4", -17.3572955, 178.1824644),
+    ("FR5", -17.4252996, 178.0779275),
+    ("FR6", -17.4203176, 178.0795745),
+    ("FR7", -17.4275448, 178.0844146),
+    ("FG1", -17.3572541, 178.1827151),
+    ("FG2", -17.3585429, 178.1847587),
+]
+obs_gdf = gpd.GeoDataFrame(
+    pd.DataFrame(obs_points_wgs84, columns=["site", "lat", "lon"]),
+    geometry=[Point(lon, lat) for _, lat, lon in obs_points_wgs84],
+    crs="EPSG:4326",
+).to_crs("EPSG:32760")
+
+for _, r in obs_gdf.iterrows():
+    col_idx = int((r.geometry.x - xmin) / 100.0)
+    row_idx = int((ymax - r.geometry.y) / 100.0)
+    for rr in range(max(0, row_idx - 1), min(nrow, row_idx + 2)):
+        for cc in range(max(0, col_idx - 1), min(ncol, col_idx + 2)):
+            if top[rr, cc] >= 0:
+                ibound[rr, cc] = 1
 
 logger.info("Basin masking completed")
 
