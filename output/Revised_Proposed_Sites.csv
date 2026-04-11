@@ -1,0 +1,10 @@
+ID,Type,Easting,Northing,Row,Col,Elevation(Z),Rationale
+Cont_Riv_2344,Continuous River (SFR),620850.0,8080250.0,78,99,3.228926658630371,Mass balance constraint at non-tidal downstream threshold
+Cont_Riv_2422,Continuous River (SFR),623450.0,8081550.0,65,125,3.0175600051879883,Mass balance constraint at non-tidal downstream threshold
+Spot_Riv_2344,Spot River (SFR),620850.0,8075650.0,124,99,20.63865089416504,Accessible valley flow calibration
+Spot_Riv_2422_Mid,Spot River (SFR),624950.0,8077950.0,101,140,15.097869873046877,Accessible valley flow calibration
+Spot_Riv_2422_Up,Spot River (SFR),623550.0,8074950.0,131,126,39.99271774291992,Accessible valley flow calibration
+GW_Malake_SGD,Groundwater (SF6),630650.0,8068050.0,200,197,4.64,Immediate onshore source of Malake SGD hotspot
+GW_Settlement_2422,Groundwater (SF6),624950.0,8085150.0,29,140,15.19,Existing settlement well tracing flow path
+GW_Settlement_2344,Groundwater (SF6),617950.0,8078350.0,97,70,19.38,Existing settlement well tracing flow path
+GW_Coastal_West,Groundwater (SF6),620350.0,8084050.0,40,94,1.69,Western coastal plains baseline

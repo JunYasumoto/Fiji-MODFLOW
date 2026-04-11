@@ -1,0 +1,13 @@
+ID,Type,Easting,Northing,Row,Col,Elevation(Z),Rationale
+New_Riv_1,Surface Water (SFR),628650.0,8077550.0,105,177,99.74639129638672,SFR Upstream - Spring/Source flow verification
+New_Riv_2,Surface Water (SFR),615750.0,8074050.0,140,48,79.93207550048828,SFR Mid-Upper - Gradient verification
+New_Riv_3,Surface Water (SFR),618850.0,8075550.0,125,79,25.019716262817383,SFR Midstream - Catchment confluence check
+New_Riv_4,Surface Water (SFR),622550.0,8076750.0,113,116,14.1312894821167,SFR Mid-Lower - Lowland entering transition
+New_Riv_5,Surface Water (SFR),622450.0,8078650.0,94,115,6.332716941833496,SFR Downstream - Coastal discharge input verification
+New_GW_1,Groundwater (SF6 & Head),611050.0,8068550.0,195,1,281.34,Highland baseline head and deep recharge age (SF6) indicator
+New_GW_2,Groundwater (SF6 & Head),628550.0,8068050.0,200,176,52.11,Mountain front recharge / transition zone flow velocity
+New_GW_3,Groundwater (SF6 & Head),634950.0,8070550.0,175,240,41.84,"Valley transmission zone, assessing K1/K2 interaction"
+New_GW_4,Groundwater (SF6 & Head),629150.0,8074150.0,139,182,19.17,Main valley plains flow path tracing
+New_GW_5,Groundwater (SF6 & Head),622550.0,8084750.0,33,116,9.43,Impact of potential anthropogenic abstraction and shallow flow
+New_GW_6,Groundwater (SF6 & Head),630150.0,8087950.0,1,192,2.73,Saltwater interface and immediate pre-SGD terrestrial head
+New_GW_7,Groundwater (SF6 & Head),628050.0,8084750.0,33,171,2.35,Terrestrial piezometer aligned directly south of primary SGD hotspot
