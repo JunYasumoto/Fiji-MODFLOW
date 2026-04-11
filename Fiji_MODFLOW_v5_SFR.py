@@ -1,0 +1,1036 @@
+#!/usr/bin/env python
+# coding: utf-8
+"""
+MODFLOW 6 Groundwater Model for Rakiraki Region, Fiji
+Version 3 - Improved solver and observation data handling
+
+Author: Hydrology Workflow
+Date: 2026-04-06
+
+Key improvements over v2:
+1. Improved IMS solver settings for non-convergence issues
+2. Corrected observation data reading from proper Excel sheets
+3. Enhanced deep groundwater flow through improved K values and convertible cells
+4. Relative path handling for GitHub compatibility
+"""
+
+import os
+import json
+import warnings
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from matplotlib.colors import LightSource, ListedColormap
+import matplotlib.patches as mpatches
+from rasterio.transform import from_origin
+from rasterio.features import rasterize
+from shapely.geometry import box, Point
+from shapely.ops import unary_union
+import scipy.ndimage
+import flopy
+import flopy.utils.binaryfile as bf
+import argparse
+import sys
+import logging
+from shapely.geometry import box, Point
+from shapely.ops import unary_union
+
+# ============================================================================
+# Section 1: Logger and Argument Parser Setup
+# ============================================================================
+
+logger = logging.getLogger("FijiMODFLOW_v3")
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+fh = logging.FileHandler('fiji_modflow_v4.log', encoding='utf-8')
+fh.setLevel(logging.INFO)
+fh.setFormatter(formatter)
+logger.addHandler(fh)
+
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+ch.setFormatter(formatter)
+logger.addHandler(ch)
+
+parser = argparse.ArgumentParser(description='Run MODFLOW 6 for Rakiraki region, Fiji.')
+parser.add_argument('--dry-run', action='store_true', help='Dry-run mode (skip execution).')
+parser.add_argument('--skip-modpath', action='store_true', help='Skip MODPATH 7 particle tracking.')
+args = parser.parse_args()
+
+if args.dry_run:
+    logger.info("=== DRY-RUN MODE ===")
+
+logger.info("=== STARTING MODFLOW 6 v4 WORKFLOW ===")
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# Section 2: Path Setup with Relative Paths
+# ============================================================================
+
+# Use relative path based on script location for GitHub compatibility
+base_dir = os.path.dirname(os.path.abspath(__file__))
+output_dir = os.path.join(base_dir, "output")
+mf6_dir = os.path.join(base_dir, "mf6_workspace")
+mp7_dir = os.path.join(base_dir, "mp7_workspace")
+
+logger.info(f"Base directory: {base_dir}")
+logger.info(f"Output directory: {output_dir}")
+logger.info(f"MODFLOW 6 workspace: {mf6_dir}")
+logger.info(f"MODPATH 7 workspace: {mp7_dir}")
+
+# Create workspaces if they don't exist
+for d in [mf6_dir, mp7_dir]:
+    if not os.path.exists(d):
+        os.makedirs(d)
+        logger.info(f"Created directory: {d}")
+
+# ============================================================================
+# Section 3: Data Loading (DEM, ibound, domain, basins)
+# ============================================================================
+
+logger.info("Loading DEM and model configuration...")
+
+# Load model domain parameters
+with open(os.path.join(output_dir, "modflow_domain.json"), 'r') as f:
+    domain = json.load(f)
+
+nrow = domain['nrow']  # 200
+ncol = domain['ncol']  # 240
+xmin = domain['xmin']  # 611000
+xmax = domain['xmax']  # 635000
+ymin = domain['ymin']  # 8068000
+ymax = domain['ymax']  # 8088000
+
+logger.info(f"Model domain: {nrow} rows x {ncol} cols, 100m cells")
+logger.info(f"Extent: xmin={xmin}, xmax={xmax}, ymin={ymin}, ymax={ymax}")
+
+# Load DEM (model top elevation) and ibound
+top = np.loadtxt(os.path.join(output_dir, "model_top.csv"), delimiter=',')
+ibound = np.loadtxt(os.path.join(output_dir, "model_ibound.csv"), delimiter=',')
+
+logger.info(f"Loaded DEM: min={top.min():.2f}m, max={top.max():.2f}m")
+
+# --- V4 FIX: Topography anomaly correction for FR5, FR6, FR7 ---
+# In reality, these rivers are at ~100m-114m elevation, but the DEM says ~50-60m.
+# This massive error causes the drain package to float above the surface. 
+# We apply a spatial Gaussian bump to physically correct the DEM in that catchment area.
+fr_correction_points = [
+    (178.0779275, -17.4252996, 110.22, 60.0), # FR5 (lon, lat, obs_elev, dem_baseline)
+    (178.0795745, -17.4203176, 98.94, 60.0),  # FR6
+    (178.0844146, -17.4275448, 114.05, 60.0)  # FR7
+]
+
+bump_array = np.zeros((nrow, ncol))
+for lon, lat, obs_elev, base in fr_correction_points:
+    # Convert to UTM 60S
+    p = gpd.GeoSeries([Point(lon, lat)], crs='EPSG:4326').to_crs('EPSG:32760').iloc[0]
+    r = int((ymax - p.y) / 100.0)
+    c = int((p.x - xmin) / 100.0)
+    if 0 <= r < nrow and 0 <= c < ncol:
+        # Diff needed to bring it to obs_elev
+        bump_height = max(0, obs_elev - top[r, c])
+        bump_array[r, c] += bump_height
+
+# Apply a smoothed, 600m-radius (sigma=6 cells) Gaussian filter to lift the local valley
+bump_smoothed = scipy.ndimage.gaussian_filter(bump_array, sigma=6.0)
+# Scale the smoothed bump back up so the peak matches the needed height
+if bump_smoothed.max() > 0:
+    scale_factor = bump_array.max() / bump_smoothed.max()
+    bump_smoothed *= scale_factor
+    
+# Apply the correction to the DEM
+top += bump_smoothed
+logger.info(f"Applied DEM topography anomaly correction. Max bump: {bump_smoothed.max():.2f}m")
+
+# Calculate Top Slope for Recharge Optimization (V4 FIX)
+dy, dx = np.gradient(top, 100.0, 100.0) # 100m cell size
+slope = np.sqrt(dx**2 + dy**2)
+logger.info(f"Calculated DEM slope: min={slope.min():.4f}, max={slope.max():.4f}")
+
+# Load basin data
+basins = gpd.read_file(os.path.join(output_dir, 'basins_clean.shp'))
+basins['VALUE'] = basins['VALUE'].astype(int).astype(str)
+
+logger.info(f"Loaded {len(basins)} basins")
+
+# ============================================================================
+# Section 4: Basin Masking and Domain Setup
+# ============================================================================
+
+logger.info("Setting up domain and basin masking based on v2 complex logic...")
+
+transform = from_origin(xmin, ymax, 100.0, 100.0)
+
+# --- 2. 解析領域の基本ポリゴンを作る (v2 logic) ---
+target_basins = []
+special_ids = ['2647', '4373', '4549', '3880', '4007', '3437', '4559']
+
+for _, row in basins.iterrows():
+    geom = row.geometry
+    val = str(row['VALUE'])
+    minx, miny, maxx, maxy = geom.bounds
+    cx, cy = geom.centroid.x, geom.centroid.y
+
+    if val in special_ids:
+        target_basins.append(geom.buffer(1))
+        continue
+
+    # 西端にはみ出したノイズ流域を除去
+    if minx < xmin + 10:
+        continue
+
+    # 南東の不要半島を除去
+    if cx > 631500 and cy < 8072000:
+        continue
+
+    # 東側南端で解析範囲をまたぐ途切れた流域を除去
+    if cx > 625000 and miny < ymin + 10:
+        continue
+
+    target_basins.append(geom.buffer(1))
+
+merged_basin = unary_union(target_basins)
+if merged_basin.geom_type == 'MultiPolygon':
+    mainland = max(merged_basin.geoms, key=lambda p: p.area)
+else:
+    mainland = merged_basin
+
+domain_box = box(xmin, ymin, xmax, ymax)
+final_basin_poly = mainland.buffer(-1).buffer(150).intersection(domain_box)
+
+# --- 3. basin_mask を作って active / inactive を更新 ---
+basin_mask = rasterize(
+    [(final_basin_poly, 1)],
+    out_shape=(nrow, ncol),
+    transform=transform,
+    fill=0,
+    all_touched=True
+)
+
+# Mark highland cells (elevation > 50m) as reference for K variation
+highland_mask = (top > 50.0)
+
+ibound[(ibound == 1) & (basin_mask == 0)] = 0
+
+# 沿岸低地は少し広めに active にして、沿岸井戸や海岸近傍地下水を入れやすくする
+coastal_open = (ibound == 0) & (basin_mask == 1) & (top < 10.0) & (top >= 0.0)
+ibound[coastal_open] = 1
+
+# --- 4. 観測点周辺は確実に active にする ---
+obs_points_wgs84 = [
+    ("FR2", -17.3803293, 178.1541107),
+    ("FR3", -17.4033547, 178.1147045),
+    ("FR4", -17.3572955, 178.1824644),
+    ("FR5", -17.4252996, 178.0779275),
+    ("FR6", -17.4203176, 178.0795745),
+    ("FR7", -17.4275448, 178.0844146),
+    ("FG1", -17.3572541, 178.1827151),
+    ("FG2", -17.3585429, 178.1847587),
+]
+obs_gdf = gpd.GeoDataFrame(
+    pd.DataFrame(obs_points_wgs84, columns=["site", "lat", "lon"]),
+    geometry=[Point(lon, lat) for _, lat, lon in obs_points_wgs84],
+    crs="EPSG:4326",
+).to_crs("EPSG:32760")
+
+for _, r in obs_gdf.iterrows():
+    col_idx = int((r.geometry.x - xmin) / 100.0)
+    row_idx = int((ymax - r.geometry.y) / 100.0)
+    for rr in range(max(0, row_idx - 1), min(nrow, row_idx + 2)):
+        for cc in range(max(0, col_idx - 1), min(ncol, col_idx + 2)):
+            if top[rr, cc] >= 0:
+                ibound[rr, cc] = 1
+
+logger.info("Basin masking completed")
+
+# ============================================================================
+# Section 5: Observation Data Loading (CORRECTED)
+# ============================================================================
+
+logger.info("Loading observation data from Excel file...")
+
+excel_file = os.path.join(base_dir, 'Fiji_field_template_v10.xlsx')
+
+if not os.path.exists(excel_file):
+    logger.warning(f"Excel file not found: {excel_file}")
+    excel_file = 'Fiji_field_template_v10.xlsx'
+
+try:
+    # Load metadata from Controls sheet
+    xl = pd.ExcelFile(excel_file)
+    controls = xl.parse('Controls', header=2)
+    antenna_height = float(controls[controls['Item'] == 'Antenna height']['Value'].values[0])
+    geoid_height = float(controls[controls['Item'] == 'Default provisional geoid height']['Value'].values[0])
+    logger.info(f"Controls: antenna_height={antenna_height}m, geoid_height={geoid_height}m")
+
+    # --- Load River observation points from River_Points sheet ---
+    # Column headers: Site (A), Lat (B), Lon (C), GNSS APC h (D), Q values (H)
+    river_data = xl.parse('River_Points', header=2).dropna(how='all')
+
+    # Convert formula references to actual values (antenna and geoid)
+    river_data['Antenna h (m)'] = antenna_height
+    river_data['Geoid N (m)'] = geoid_height
+    river_data['Ground elev (m)'] = (
+        river_data['GNSS APC h (m)'] -
+        river_data['Antenna h (m)'] -
+        river_data['Geoid N (m)']
+    )
+
+    # Build river observation dataframe
+    river_obs = pd.DataFrame({
+        'site': river_data['Site'],
+        'lat': river_data['Lat'],
+        'lon': river_data['Lon'],
+        'elev': river_data['Ground elev (m)'],
+        'q_obs': pd.to_numeric(river_data['Approx observed Q (m3/s)'], errors='coerce')
+    })
+
+    # Filter valid records
+    river_obs = river_obs[river_obs['site'].isin(['FR2', 'FR3', 'FR4', 'FR5', 'FR6', 'FR7'])].copy()
+    river_obs = river_obs.dropna(subset=['lat', 'lon', 'elev'])
+
+    logger.info(f"Loaded {len(river_obs)} river observation points")
+    logger.info("\nRiver observations:")
+    for _, row in river_obs.iterrows():
+        q_str = f"{row['q_obs']:.4f}" if pd.notna(row['q_obs']) else "NaN"
+        logger.info(f"  {row['site']}: elev={row['elev']:.2f}m, Q={q_str} m³/s")
+
+    # --- Load Groundwater observation points from Groundwater sheet ---
+    # Column headers: Site (A), Lat (B), Lon (C), GNSS APC h (D), DTW (H)
+    gw_data = xl.parse('Groundwater', header=2).dropna(how='all')
+
+    # Convert formula references
+    gw_data['Antenna h (m)'] = antenna_height
+    gw_data['Geoid N (m)'] = geoid_height
+    gw_data['Ground elev (m)'] = (
+        gw_data['GNSS APC h (m)'] -
+        gw_data['Antenna h (m)'] -
+        gw_data['Geoid N (m)']
+    )
+
+    # Compute groundwater head from depth-to-water
+    gw_data['GW head (m)'] = np.where(
+        pd.notna(gw_data['Depth to water (m)']) & (gw_data['Depth to water (m)'] != ''),
+        gw_data['Ground elev (m)'] - gw_data['Depth to water (m)'],
+        np.nan
+    )
+
+    # Build groundwater observation dataframe
+    gw_obs = pd.DataFrame({
+        'site': gw_data['Site'],
+        'lat': gw_data['Lat'],
+        'lon': gw_data['Lon'],
+        'elev': gw_data['Ground elev (m)'],
+        'dtw': pd.to_numeric(gw_data['Depth to water (m)'], errors='coerce'),
+        'head_obs': gw_data['GW head (m)']
+    })
+
+    # Filter valid records (Exclude FG9 which is on another island)
+    gw_obs = gw_obs[gw_obs['site'].isin([f'FG{i}' for i in range(1, 9)])].copy()
+    gw_obs = gw_obs.dropna(subset=['lat', 'lon', 'elev'])
+
+    logger.info(f"Loaded {len(gw_obs)} groundwater observation points")
+    logger.info("\nGroundwater observations:")
+    for _, row in gw_obs.iterrows():
+        head_str = f"{row['head_obs']:.2f}m" if pd.notna(row['head_obs']) else "NaN"
+        dtw_str = f"{row['dtw']:.2f}m" if pd.notna(row['dtw']) else "NaN"
+        logger.info(f"  {row['site']}: elev={row['elev']:.2f}m, DTW={dtw_str}, head={head_str}")
+
+    # Convert to UTM coordinates (EPSG:32760)
+    river_gdf = gpd.GeoDataFrame(
+        river_obs,
+        geometry=[Point(xy) for xy in zip(river_obs['lon'], river_obs['lat'])],
+        crs='EPSG:4326'
+    ).to_crs('EPSG:32760')
+
+    gw_gdf = gpd.GeoDataFrame(
+        gw_obs,
+        geometry=[Point(xy) for xy in zip(gw_obs['lon'], gw_obs['lat'])],
+        crs='EPSG:4326'
+    ).to_crs('EPSG:32760')
+
+    # Convert to row/col indices
+    def get_rc(x, y, xmin, ymax, cellsize=100.0):
+        col = int((x - xmin) / cellsize)
+        row = int((ymax - y) / cellsize)
+        return row, col
+
+    river_gdf['row'] = river_gdf.geometry.apply(lambda g: get_rc(g.x, g.y, xmin, ymax)[0])
+    river_gdf['col'] = river_gdf.geometry.apply(lambda g: get_rc(g.x, g.y, xmin, ymax)[1])
+    gw_gdf['row'] = gw_gdf.geometry.apply(lambda g: get_rc(g.x, g.y, xmin, ymax)[0])
+    gw_gdf['col'] = gw_gdf.geometry.apply(lambda g: get_rc(g.x, g.y, xmin, ymax)[1])
+
+    # Mark points inside model domain
+    river_gdf['inside_model'] = (
+        (river_gdf['row'] >= 0) & (river_gdf['row'] < nrow) &
+        (river_gdf['col'] >= 0) & (river_gdf['col'] < ncol)
+    )
+    gw_gdf['inside_model'] = (
+        (gw_gdf['row'] >= 0) & (gw_gdf['row'] < nrow) &
+        (gw_gdf['col'] >= 0) & (gw_gdf['col'] < ncol)
+    )
+
+    # Save observation locations for reference
+    river_gdf.drop(columns=['geometry']).to_csv(
+        os.path.join(output_dir, 'river_obs_v3.csv'), index=False
+    )
+    gw_gdf.drop(columns=['geometry']).to_csv(
+        os.path.join(output_dir, 'gw_obs_v3.csv'), index=False
+    )
+    logger.info("Saved observation locations to river_obs_v3.csv and gw_obs_v3.csv")
+
+    # Ensure observation points are marked as active in model
+    for _, row in river_gdf.iterrows():
+        if row['inside_model']:
+            r, c = int(row['row']), int(row['col'])
+            for rr in range(max(0, r-1), min(nrow, r+2)):
+                for cc in range(max(0, c-1), min(ncol, c+2)):
+                    if top[rr, cc] >= 0:
+                        ibound[rr, cc] = 1
+
+    for _, row in gw_gdf.iterrows():
+        if row['inside_model']:
+            r, c = int(row['row']), int(row['col'])
+            for rr in range(max(0, r-1), min(nrow, r+2)):
+                for cc in range(max(0, c-1), min(ncol, c+2)):
+                    if top[rr, cc] >= 0:
+                        ibound[rr, cc] = 1
+
+except Exception as e:
+    logger.error(f"Error loading observation data: {e}")
+    logger.info("Continuing without observation data...")
+    river_gdf = None
+    gw_gdf = None
+
+logger.info("Observation data loading completed")
+
+# ============================================================================
+# Section 6: Layer Structure Setup
+# ============================================================================
+
+logger.info("Setting up layer structure...")
+
+# 層の設定
+# Layer 1: 0 ~ -50m (50m thick) - phreatic layer
+# Layer 2: -50 ~ -100m (50m thick) - convertible to confined
+# Layer 3: -100 ~ -250m (150m thick) - confined
+# Layer 4: -250 ~ -700m (450m thick) - deep confined
+nlay = 4
+botm = np.zeros((nlay, nrow, ncol))
+botm[0] = top - 50.0       # L1 bottom
+botm[1] = botm[0] - 50.0   # L2 bottom
+botm[2] = botm[1] - 150.0  # L3 bottom
+botm[3] = botm[2] - 450.0  # L4 bottom (deepest)
+
+logger.info(f"Layer configuration:")
+logger.info(f"  L1: 50m (phreatic)")
+logger.info(f"  L2: 50m (convertible)")
+logger.info(f"  L3: 150m (confined)")
+logger.info(f"  L4: 450m (deep confined)")
+
+# Set idomain for all non-inactive cells
+idomain = np.array([np.where(ibound != 0, 1, 0)] * nlay)
+
+logger.info("Layer structure completed")
+
+# ============================================================================
+# Section 7: MODFLOW 6 Model Build with Improved Parameters
+# ============================================================================
+
+logger.info("Building MODFLOW 6 model...")
+
+sim_name = "MF_FIJI_v5"
+sim = flopy.mf6.MFSimulation(sim_name=sim_name, version="mf6", exe_name="mf6", sim_ws=mf6_dir)
+
+# Time discretization: 1 stress period
+tdis = flopy.mf6.ModflowTdis(
+    sim,
+    time_units="DAYS",
+    nper=1,
+    perioddata=[(1.0, 1, 1.0)]
+)
+
+logger.info("TDIS package created")
+
+# ============================================================================
+# Section 8: Improved IMS Solver Settings
+# ============================================================================
+# 【改善点】ソルバー非収束対策
+# - outer_dvclose, inner_dvclose で水頭変化の収束判定
+# - rcloserecord で残差の収束判定（strict mode）
+# - DBD under-relaxation で振動を抑制
+# - BICGSTAB加速器で収束速度向上
+# - outer_maximum, inner_maximum を増加
+
+logger.info("Configuring improved IMS solver settings...")
+
+ims = flopy.mf6.ModflowIms(
+    sim,
+    complexity="COMPLEX",           # ILUT前処理（ill-conditioned行列に必要）
+    outer_maximum=800,
+    inner_maximum=300,
+    outer_dvclose=0.01,
+    inner_dvclose=0.001,
+    rcloserecord=[0.1, "strict"],
+    linear_acceleration="BICGSTAB",
+    backtracking_number=15,
+    backtracking_tolerance=1.05,
+    backtracking_reduction_factor=0.2,
+    backtracking_residual_limit=50.0
+)
+
+logger.info("IMS solver configured with improved convergence settings")
+
+# Create groundwater flow model
+gwf = flopy.mf6.ModflowGwf(
+    sim,
+    modelname=sim_name,
+    save_flows=True,
+    newtonoptions="NEWTON UNDER_RELAXATION"
+)
+
+# Discretization
+dis = flopy.mf6.ModflowGwfdis(
+    gwf,
+    nlay=nlay,
+    nrow=nrow,
+    ncol=ncol,
+    delr=100.0,
+    delc=100.0,
+    top=top,
+    botm=botm,
+    idomain=idomain,
+    xorigin=xmin,
+    yorigin=ymin
+)
+
+logger.info("DIS package created")
+
+# ============================================================================
+# Section 9: Node Property Flow (NPF) with Improved K Values
+# ============================================================================
+# 【改善点】深い地下水流を促進するため、深層のK値を増加
+# - L1: k=8-15 (from 12-20) - shallow流を少し抑制
+# - L2: k=3-6 (from 4-8) - shallow層間流を抑制
+# - L3: k=1.0-2.0 (from 0.5) - 深層流を促進（3倍）
+# - L4: k=0.2-0.5 (from 0.05) - 最深層を促進（5-10倍）
+# - icelltype=[1,1,0,0]: L1,L2可変飽和、L3,L4被圧
+#   （L2も可変飽和に変更して、L2-L3間での垂直流を柔軟に）
+
+logger.info("Setting up improved hydraulic conductivity (K) distribution...")
+
+# K値の設定（第5弾 V4 調整）
+# 【調整】FG1水頭がまだ低い → V4では FG1周辺の特異的なK値低下を行い、物理的に水頭を押し上げる
+k1_default = 2.0   
+k2_default = 1.5   
+k3_default = 8.0   
+k4_default = 4.0   
+
+k1 = np.full((nrow, ncol), k1_default)
+k2 = np.full((nrow, ncol), k2_default)
+k3 = np.full((nrow, ncol), k3_default)
+k4 = np.full((nrow, ncol), k4_default)
+
+# 山地では火山岩マトリクス主体の透水性の低さを反映し、地下水位が地表まで上がるようにする
+k1[highland_mask] = 0.5    # 非常に硬い岩盤（表層でも0.5 m/d）
+k2[highland_mask] = 0.1    # 深層へ向かって透水性は低下
+k3[highland_mask] = 0.05   # これにより水がザルのように抜け落ちるのを防ぐ
+k4[highland_mask] = 0.01   
+
+# --- V4 FIX: Localized K adjustment for FG1 ---
+# FG1 location: lon=178.1827151, lat=-17.3572541. 
+fg1_p = gpd.GeoSeries([Point(178.1827151, -17.3572541)], crs='EPSG:4326').to_crs('EPSG:32760').iloc[0]
+fg1_r = int((ymax - fg1_p.y) / 100.0)
+fg1_c = int((fg1_p.x - xmin) / 100.0)
+
+# Create a spatial distance array from FG1 to smoothly transition the K
+y_idx, x_idx = np.indices((nrow, ncol))
+dist_from_fg1 = np.sqrt((y_idx - fg1_r)**2 + (x_idx - fg1_c)**2)
+
+# Within roughly 1km (10 cells), lower the K value by a factor of 0.2 to 0.4 to simulate tighter alluvial clays 
+# which will naturally back-up the groundwater level and match the 33.7m observation.
+fg1_influence = np.clip(1.0 - (dist_from_fg1 / 15.0), 0.0, 1.0)
+# Minimum K multiplier is 0.3 (70% reduction at epicenter)
+k_multiplier = 1.0 - (0.7 * fg1_influence)
+
+k1 *= k_multiplier
+k2 *= k_multiplier
+
+logger.info(f"Applied FG1 localized K correction. Minimum multiplier: {k_multiplier.min():.2f}")
+
+logger.info(f"K values (m/day):")
+logger.info(f"  L1: {k1.min():.2f} ~ {k1.max():.2f}")
+logger.info(f"  L2: {k2.min():.2f} ~ {k2.max():.2f}")
+logger.info(f"  L3: {k3.min():.2f} ~ {k3.max():.2f}")
+logger.info(f"  L4: {k4.min():.2f} ~ {k4.max():.2f}")
+
+# Vertical anisotropy (K_horizontal / K_vertical = 10)
+npf = flopy.mf6.ModflowGwfnpf(
+    gwf,
+    icelltype=[1, 0, 0, 0],  # L1のみ不圧（物理的に妥当）、L2-L4は被圧
+    k=[k1, k2, k3, k4],
+    k33=[k1/10, k2/10, k3/10, k4/10],
+    save_flows=True
+)
+
+logger.info("NPF package created with improved K distribution")
+
+# ============================================================================
+# Section 10: Initial Conditions and Boundary Conditions
+# ============================================================================
+
+logger.info("Setting up initial and boundary conditions...")
+
+# Initial conditions
+# 初期水頭をDEMより少し低く設定（water table ≈ 地表面の80%程度）
+# これによりNEWTONソルバーの初期推定が改善され、収束が速くなる
+strt_array = np.zeros((nlay, nrow, ncol))
+for l in range(nlay):
+    strt_array[l] = np.where(top < 0, 0.0, np.maximum(top * 0.8, 0.0))
+
+ic = flopy.mf6.ModflowGwfic(gwf, strt=strt_array)
+
+# Constant head (海岸: 0m海抜)
+# 浅い2層のみにCHDを適用し、深層の地下水流動を阻害しない
+chd_layers = [0, 1]  # L1, L2のみ
+chd_spd = [
+    [(l, r, c), 0.0] for r, c in zip(*np.where(ibound == -1)) for l in chd_layers
+]
+chd = flopy.mf6.ModflowGwfchd(gwf, stress_period_data=chd_spd)
+
+logger.info(f"CHD boundary: {len(chd_spd)} cells at sea level")
+
+# Recharge (涵養)
+# --- V4 FIX: Slope-based Recharge Distribution ---
+# フィジーの年間降水量は2000-3000mm、平均涵養率30%として全体1.83 m/year (0.005 m/day)
+base_rch = 0.005   
+
+# 勾配（slope）に基づく涵養係数の計算
+# 勾配が小さい（<0.05）ほど浸透しやすく（最大1.5倍）、急勾配（>0.5）ほど地表流出する（最小0.2倍）
+slope_factor = np.clip(1.5 - 2.6 * slope, 0.2, 1.5)
+
+rch_array = np.zeros((nrow, ncol))
+rch_array[ibound != 0] = base_rch * slope_factor[ibound != 0]
+
+rch = flopy.mf6.ModflowGwfrcha(gwf, recharge=rch_array)
+
+logger.info(f"Recharge optimized by Slope: min={rch_array[ibound != 0].min():.4f}, max={rch_array[ibound != 0].max():.4f} m/day")
+
+logger.info("Boundary conditions setup completed")
+
+# ============================================================================
+# Section 11: SFR Package (Streamflow-Routing)
+# ============================================================================
+logger.info("Setting up SFR (Streamflow-Routing) package for rivers...")
+
+# Load stream network
+streams_gdf = gpd.read_file(os.path.join(output_dir, "streams.shp"))
+stream_grid = rasterize(
+    [(geom, 1) for geom in streams_gdf.geometry],
+    out_shape=(nrow, ncol),
+    transform=transform,
+    fill=0,
+    all_touched=True
+)
+
+# Identify stream cells
+stream_rows, stream_cols = np.where((stream_grid == 1) & (ibound == 1) & (top >= 0))
+stream_data = sorted([(r, c, top[r, c]) for r, c in zip(stream_rows, stream_cols)], key=lambda x: x[2], reverse=True)
+
+logger.info(f"Building SFR network with {len(stream_data)} stream cells")
+
+stream_cells = {(r, c): {'rno': i, 'Z': z} for i, (r, c, z) in enumerate(stream_data)}
+adj_in, adj_out = {i: [] for i in range(len(stream_data))}, {i: [] for i in range(len(stream_data))}
+
+# Create stream topology (High elevation to Low elevation)
+for (r, c), data in stream_cells.items():
+    u, lowest_z, v = data['rno'], data['Z'], None
+    # Look at 8 neighbors
+    for dr, dc in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]:
+        if (r+dr, c+dc) in stream_cells and stream_cells[(r+dr, c+dc)]['Z'] < lowest_z:
+            lowest_z, v = stream_cells[(r+dr, c+dc)]['Z'], stream_cells[(r+dr, c+dc)]['rno']
+    if v is not None:
+        adj_out[u].append(v)
+        adj_in[v].append(u)
+
+# Create packagedata and connectiondata
+best_rhk = 10.0 # K of stream bed
+packagedata = []
+connectiondata = []
+sfr_plot_data = []
+
+# Map observation sites to reach IDs
+obs_cell_lookup = {}
+if river_gdf is not None:
+    for _, rr in river_gdf.iterrows():
+        if pd.notna(rr['row']) and pd.notna(rr['col']):
+            r_obs, c_obs = int(rr['row']), int(rr['col'])
+            for dr in range(-2, 3):
+                for dc in range(-2, 3):
+                    nr, nc = r_obs + dr, c_obs + dc
+                    if 0 <= nr < nrow and 0 <= nc < ncol:
+                        if stream_grid[nr, nc] == 1 and ibound[nr, nc] == 1:
+                            obs_cell_lookup[(nr, nc)] = rr['site']
+
+reach_to_obs = {}
+
+for i, (r, c, z) in enumerate(stream_data):
+    packagedata.append([i, (0, r, c), 100.0, 5.0, 0.01, z, 1.0, best_rhk, 0.03, len(adj_in[i]) + len(adj_out[i]), 1.0, 0])
+    connectiondata.append([i] + adj_in[i] + [-x for x in adj_out[i]])
+    sfr_plot_data.append([r, c])
+    
+    site = obs_cell_lookup.get((r, c), None)
+    if site:
+        if site not in reach_to_obs:
+            reach_to_obs[site] = []
+        reach_to_obs[site].append({'rno': i, 'z': z})
+
+import json
+with open(os.path.join(output_dir, 'sfr_reach_to_obs.json'), 'w') as f:
+    json.dump(reach_to_obs, f)
+
+sfr = flopy.mf6.ModflowGwfsfr(
+    gwf,
+    budget_filerecord=f"{sim_name}.sfr.cbc",
+    stage_filerecord=f"{sim_name}.sfr.stage",
+    nreaches=len(packagedata),
+    packagedata=packagedata,
+    connectiondata=connectiondata,
+    save_flows=True
+)
+
+# Setup SFR Observations to easily extract Streamflow (Q) using EXT-OUTFLOW or DOWNSTREAM-FLOW
+sfr_obs_data = []
+for site, rno_list in reach_to_obs.items():
+    lowest_rno = min(rno_list, key=lambda x: x['z'])['rno']
+    # 'ext-outflow' measures water leaving the reach to outside the model (if it's a boundary)
+    # 'downstream-flow' measures flow to the next reach
+    sfr_obs_data.append((site, "downstream-flow", (lowest_rno,)))
+
+obs_dict = {f"{sim_name}.sfr.obs.csv": sfr_obs_data}
+sfr.obs.initialize(filename=f"{sim_name}.sfr.obs", digits=10, print_input=True, continuous=obs_dict)
+
+pd.DataFrame(sfr_plot_data, columns=['Row', 'Col']).to_csv(os.path.join(output_dir, "sfr_cells_v5.csv"), index=False)
+logger.info(f"SFR package created successfully with {len(packagedata)} reaches and observation points.")
+
+# ============================================================================
+# Section 12: Output Control
+# ============================================================================
+
+oc = flopy.mf6.ModflowGwfoc(
+    gwf,
+    head_filerecord=f"{sim_name}.hds",
+    budget_filerecord=f"{sim_name}.cbc",
+    saverecord=[('HEAD', 'ALL'), ('BUDGET', 'ALL')]
+)
+
+logger.info("Output control configured")
+
+# ============================================================================
+# Section 13: Write and Run Simulation
+# ============================================================================
+
+logger.info("Writing MODFLOW 6 input files...")
+
+success = False
+if not args.dry_run:
+    try:
+        sim.write_simulation()
+        logger.info("Simulation files written successfully")
+
+        logger.info("Running MODFLOW 6 simulation...")
+        success, buff = sim.run_simulation()
+
+        if success:
+            logger.info("MODFLOW 6 simulation completed successfully!")
+        else:
+            logger.warning("MODFLOW 6 simulation did not fully converge.")
+            logger.warning("Proceeding with post-processing (results may still be usable).")
+    except Exception as e:
+        logger.error(f"Error during simulation: {e}")
+else:
+    logger.info("[DRY-RUN] Skipping simulation execution")
+
+# ============================================================================
+# Section 14: Post-Processing and Observation Comparison
+# ============================================================================
+# 【重要】未収束でも .hds が出力されていれば後処理を実行する。
+# v2では未収束ながら水収支0.02%で有用な結果が得られていた。
+
+logger.info("Post-processing simulation results...")
+
+# .hds ファイルが存在すれば後処理を行う（収束の有無にかかわらず）
+hds_exists = os.path.exists(os.path.join(mf6_dir, f"{sim_name}.hds"))
+if not args.dry_run and hds_exists:
+    try:
+        # Read heads from binary file
+        head_file = os.path.join(mf6_dir, f"{sim_name}.hds")
+        if os.path.exists(head_file):
+            hds = bf.HeadFile(head_file)
+            heads = hds.get_data(totim=hds.get_times()[-1])  # Last time step
+            logger.info(f"Read heads: min={heads.min():.2f}m, max={heads.max():.2f}m")
+
+            # Save head array for layer 1 (phreatic)
+            np.savetxt(os.path.join(output_dir, 'heads_l1_v3.csv'), heads[0], delimiter=',')
+            logger.info("Saved L1 heads to heads_l1_v3.csv")
+
+            # Compare with groundwater observations
+            if gw_gdf is not None and len(gw_gdf) > 0:
+                logger.info("\nComparison with GW observations:")
+                logger.info("Site | Model head (m) | Obs head (m) | Diff (m)")
+                logger.info("-" * 50)
+
+                for _, row in gw_gdf.iterrows():
+                    if row['inside_model'] and pd.notna(row['head_obs']):
+                        r, c = int(row['row']), int(row['col'])
+                        if 0 <= r < nrow and 0 <= c < ncol:
+                            model_head = heads[0, r, c]
+                            obs_head = row['head_obs']
+                            diff = model_head - obs_head
+                            logger.info(f"{row['site']:5} | {model_head:14.2f} | {obs_head:11.2f} | {diff:8.2f}")
+
+            # Compare with river observations (using SFR Flow Q)
+            if river_gdf is not None and len(river_gdf) > 0:
+                logger.info("\nComparison with river SFR observations (Q m3/s):")
+                logger.info("Site | Model Q(m3/s) | Obs Q(m3/s) | Diff (m3/s)")
+                logger.info("-" * 50)
+
+                # Find the downstream-most reach for each observation site
+                site_q_map = {}
+                sfr_cbc_path = os.path.join(mf6_dir, f"{sim_name}.sfr.cbc")
+                if os.path.exists(sfr_cbc_path):
+                    try:
+                        sfr_cbc = bf.CellBudgetFile(sfr_cbc_path)
+                        # Extract EXT-OUTFLOW which relates to water leaving the reach to outside
+                        # Or FLOW-JA-FACE for down-reach flow.
+                        # The safer way is to just sum GWF flow or extract Q from output.
+                        # Actually, flopy utils output budget can be tricky. Let's just use it conceptually if not accessible:
+                        flow_ja = sfr_cbc.get_data(text="FLOW-JA-FACE")
+                        if len(flow_ja) > 0:
+                            sfr_flows = flow_ja[-1]
+                        else:
+                            sfr_flows = None
+                    except Exception as e:
+                        logger.error(f"Error reading SFR cbc: {e}")
+                        sfr_flows = None
+                
+                # Read the explicitly generated SFR obs CSV
+                sfr_obs_csv = os.path.join(mf6_dir, f"{sim_name}.sfr.obs.csv")
+                sim_q_dict = {}
+                if os.path.exists(sfr_obs_csv):
+                    try:
+                        # Modflow obs csv has headers like "time", "FR5", "FR6"
+                        sobs_df = pd.read_csv(sfr_obs_csv)
+                        last_row = sobs_df.iloc[-1]
+                        for col in sobs_df.columns:
+                            if col.upper() != 'TIME':
+                                sim_q_dict[col.upper()] = last_row[col]
+                    except Exception as e:
+                        logger.error(f"Error reading SFR obs csv: {e}")
+
+                sfr_stage_path = os.path.join(mf6_dir, f"{sim_name}.sfr.stage")
+                if os.path.exists(sfr_stage_path):
+                    sfr_stage = bf.HeadFile(sfr_stage_path, text="STAGE").get_data()[-1]
+                else:
+                    sfr_stage = None
+
+                for site, rno_list in reach_to_obs.items():
+                    # Pick the reach with the lowest z (most downstream in that cluster)
+                    lowest_rno = min(rno_list, key=lambda x: x['z'])['rno']
+                    stage_val = sfr_stage[lowest_rno][0][0] if sfr_stage is not None and len(sfr_stage) > lowest_rno else 0.0
+
+                    # Get Model Q and convert from m3/day to m3/s
+                    # MODFLOW uses DAYS as time unit, so SFR output is in m3/day
+                    model_q_m3d = sim_q_dict.get(site.upper(), 0.0)
+                    model_q_m3s = abs(model_q_m3d) / 86400.0
+
+                    # Get obs Q
+                    match = river_obs[river_obs['site'] == site]
+                    if len(match) > 0:
+                        obs_q = match.iloc[0]['q_obs']
+                        if pd.notna(obs_q):
+                            diff_q = model_q_m3s - obs_q
+                            logger.info(f"{site:5} | {model_q_m3s:13.4f} | {obs_q:11.4f} | {diff_q:11.4f}")
+                            
+        else:
+            logger.warning(f"Head file not found: {head_file}")
+    except Exception as e:
+        logger.error(f"Error in post-processing: {e}")
+
+# ============================================================================
+# Section 15: MODPATH 7 Particle Tracking
+# ============================================================================
+
+if not args.dry_run and hds_exists and not args.skip_modpath:
+    logger.info("Setting up MODPATH 7 particle tracking...")
+
+    try:
+        # 山岳部（標高50m以上）のセルから粒子を発生
+        head_for_mp = bf.HeadFile(os.path.join(mf6_dir, f"{sim_name}.hds")).get_data()
+        highland_locs_mask = (top > 50.0) & (ibound == 1) & (np.abs(head_for_mp[0]) < 1000)
+        rows_mp, cols_mp = np.where(highland_locs_mask)
+
+        # 10セルに1つの割合で間引き
+        locs = [(0, r, c) for r, c in zip(rows_mp[::10], cols_mp[::10])]
+
+        mp_name = f"{sim_name}_mp7"
+        mp = flopy.modpath.Modpath7(
+            modelname=mp_name,
+            flowmodel=gwf,
+            exe_name="mp7",
+            model_ws=mp7_dir
+        )
+
+        # 深層の空隙率を増加して深層流動を促進
+        mpbas = flopy.modpath.Modpath7Bas(
+            mp,
+            porosity=[0.25, 0.20, 0.10, 0.08]  # L3,L4の空隙率を増加
+        )
+
+        particledata = flopy.modpath.ParticleData(
+            locs,
+            structured=True,
+            drape=0,
+            localx=0.5,
+            localy=0.5,
+            localz=0.9
+        )
+        pg = flopy.modpath.ParticleGroup(
+            particledata=particledata,
+            particlegroupname="Highland_Recharge"
+        )
+
+        mpsim = flopy.modpath.Modpath7Sim(
+            mp,
+            simulationtype="pathline",
+            trackingdirection="forward",
+            weaksinkoption="pass_through",
+            weaksourceoption="pass_through",
+            particlegroups=[pg]
+        )
+
+        mp.write_input()
+        logger.info(f"MODPATH 7 configured with {len(locs)} release points")
+
+        mp_success, _ = mp.run_model(silent=True)
+        if mp_success:
+            logger.info("MODPATH 7 completed successfully!")
+
+            # 結果の集計
+            p_file = os.path.join(mp7_dir, f"{mp_name}.mppth")
+            if os.path.exists(p_file):
+                plines = flopy.utils.PathlineFile(p_file).get_alldata()
+                deep = [p for p in plines if np.min(p['z']) < -100]
+                shallow = [p for p in plines if np.min(p['z']) >= -100]
+                logger.info(f"Pathline summary: {len(plines)} total, {len(shallow)} shallow, {len(deep)} deep (z < -100m)")
+        else:
+            logger.warning("MODPATH 7 did not complete successfully")
+
+    except Exception as e:
+        logger.error(f"Error in MODPATH 7: {e}")
+
+# ============================================================================
+# Section 16: Visualization (Plan View and Cross-Section)
+# ============================================================================
+
+logger.info("Creating visualizations...")
+
+if not args.dry_run and hds_exists:
+    try:
+        # Read heads
+        head_file = os.path.join(mf6_dir, f"{sim_name}.hds")
+        if os.path.exists(head_file):
+            hds = bf.HeadFile(head_file)
+            heads = hds.get_data(totim=hds.get_times()[-1])
+
+            # Plan View Plotting
+            fig, ax = plt.subplots(figsize=(14, 10))
+            extent = [xmin, xmax, ymin, ymax]
+            heads_ma = np.ma.masked_where((heads[0] > 1e10) | (heads[0] < -100) | (ibound == 0), heads[0])
+            
+            pmv = flopy.plot.PlotMapView(model=gwf, ax=ax, layer=0)
+            im = pmv.plot_array(heads_ma, cmap='viridis', alpha=0.8, vmin=0, vmax=150)
+            
+            # Plot Head Contours
+            contours = pmv.contour_array(heads[0], masked_values=[1e30], levels=np.arange(0, 160, 10), colors='white', linewidths=0.5, alpha=0.8)
+            plt.clabel(contours, fmt='%.0f', colors='white', fontsize=8)
+
+            p_file = os.path.join(mp7_dir, f"{sim_name}_mp7.mppth")
+            if os.path.exists(p_file):
+                plines = flopy.utils.PathlineFile(p_file).get_alldata()
+                pmv.plot_pathline(plines, layer='all', colors='white', lw=1.2, alpha=0.8, label='Pathlines')
+
+            # Plot Points MANUALLY to guarantee they are HUGE
+            if river_gdf is not None and not river_gdf.empty:
+                ax.scatter(river_gdf.geometry.x, river_gdf.geometry.y, c='red', s=350, marker='s', edgecolors='black', linewidths=2.0, zorder=10, label='River Obs (FR)')
+            if gw_gdf is not None and not gw_gdf.empty:
+                ax.scatter(gw_gdf.geometry.x, gw_gdf.geometry.y, c='aqua', s=350, marker='^', edgecolors='black', linewidths=2.0, zorder=10, label='GW Obs (FG)')
+
+            ax.set_xlim([xmin, xmax])
+            ax.set_ylim([ymin, ymax])
+            ax.set_title("MODFLOW 6 v5 (SFR) - Layer 1 Hydraulic Head & Pathlines", fontsize=18)
+            ax.set_xlabel("UTM Easting (m)", fontsize=14)
+            ax.set_ylabel("UTM Northing (m)", fontsize=14)
+            plt.colorbar(im, ax=ax, label="Head (m)")
+            ax.legend(loc='lower right', fontsize=14)
+
+            plan_view_file = os.path.join(output_dir, 'modflow_v4_plan_view.png')
+            plt.savefig(plan_view_file, dpi=300, bbox_inches='tight')
+            logger.info(f"Saved plan view: {plan_view_file}")
+            plt.close()
+
+            # Cross Section
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12))
+            col_idx = ncol // 2
+            ys = ymax - np.arange(nrow) * 100.0 - 50.0
+
+            ax1.plot(ys, top[:, col_idx], 'k-', linewidth=3, label='DEM')
+            for l in range(nlay):
+                ax1.plot(ys, botm[l, :, col_idx], 'k--', linewidth=1, alpha=0.5)
+
+            colors = ['blue', 'cyan', 'green', 'goldenrod']
+            for l in range(nlay):
+                heads_ma_xs = np.ma.masked_where((heads[l, :, col_idx] > 1e10) | (heads[l, :, col_idx] < -100) | (ibound[:, col_idx] == 0), heads[l,:,col_idx])
+                ax1.plot(ys, heads_ma_xs, label=f'L{l+1} Head', linewidth=2.5, color=colors[l])
+
+            ax1.set_ylim([-600, np.nanmax(top[:, col_idx]) + 50])
+            ax1.set_ylabel("Elevation (m)", fontsize=14)
+            ax1.set_title(f"Cross-section (Northing profile) at Column {col_idx} (Easting ~ {xmin + col_idx*100}m)", fontsize=16)
+            ax1.legend(loc='upper right', fontsize=12)
+            ax1.grid(True)
+
+            ax2.plot(ys, k1[:, col_idx], label='K1', linewidth=1.5)
+            ax2.plot(ys, k2[:, col_idx], label='K2', linewidth=1.5)
+            ax2.plot(ys, k3[:, col_idx], label='K3', linewidth=1.5)
+            ax2.plot(ys, k4[:, col_idx], label='K4', linewidth=1.5)
+            ax2.set_xlabel("Northing (m)", fontsize=14)
+            ax2.set_ylabel("K (m/day)", fontsize=14)
+            ax2.legend()
+            ax2.grid(True)
+
+            xsec_file = os.path.join(output_dir, 'modflow_v3_cross_section.png')
+            plt.savefig(xsec_file, dpi=300, bbox_inches='tight')
+            logger.info(f"Saved cross-section: {xsec_file}")
+            plt.close()
+
+
+
+    except Exception as e:
+        logger.error(f"Error in visualization: {e}")
+
+# ============================================================================
+# Summary and Completion
+# ============================================================================
+
+logger.info("\n" + "="*70)
+logger.info("MODFLOW 6 v4 Workflow Completed")
+logger.info("="*70)
+logger.info(f"Output directory: {output_dir}")
+logger.info(f"MODFLOW workspace: {mf6_dir}")
+logger.info(f"MODPATH workspace: {mp7_dir}")
+logger.info(f"Log file: fiji_modflow_v5_sfr.log")
+logger.info("="*70)
+
+# End of script
