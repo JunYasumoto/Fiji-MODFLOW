@@ -463,7 +463,9 @@ dis = flopy.mf6.ModflowGwfdis(
     delc=100.0,
     top=top,
     botm=botm,
-    idomain=idomain
+    idomain=idomain,
+    xorigin=xmin,
+    yorigin=ymin
 )
 
 logger.info("DIS package created")
